@@ -1,110 +1,75 @@
+"""Streamlit dashboard for visualising Tokyo ward crime data."""
+
+from __future__ import annotations
+
 import io
 from difflib import SequenceMatcher
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional
 
-try:  # pragma: no cover - import is validated in tests via stubs
-    import pandas as pd  # type: ignore
-    from pandas.errors import ParserError  # type: ignore
-except ImportError:  # pragma: no cover - runtime guard for optional dependency
-    pd = None  # type: ignore
-
-    class ParserError(Exception):
-        """Fallback parser error used when pandas is unavailable."""
-
-        pass
-
-try:  # pragma: no cover - import exercised when running the UI
-    import streamlit as st  # type: ignore
-except ImportError:  # pragma: no cover - allows importing the module in tests
-    st = None  # type: ignore
-
-if TYPE_CHECKING:  # pragma: no cover - typing aide
-    import pandas as _pd
+import pandas as pd
+import streamlit as st
 
 TOKYO_CENTER = {"lat": 35.6762, "lon": 139.6503}
 
 
-def ensure_pandas_available() -> None:
-    """Ensure pandas is installed before performing dataframe operations."""
+def read_tabular_file(uploaded_file: io.BytesIO) -> pd.DataFrame:
+    """Load a CSV or Excel file into a DataFrame."""
 
-    if pd is None:  # pragma: no cover - defensive runtime guard
-        raise ImportError(
-            "pandas がインストールされていません。`pip install -r requirements.txt` を実行して依存関係を整えてください。"
-        )
+    name = uploaded_file.name.lower()
+    uploaded_file.seek(0)
 
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(uploaded_file)
 
-def load_tabular_file(uploaded_file: io.BytesIO) -> Tuple["_pd.DataFrame", List[str]]:
-    """Return a dataframe from a CSV or Excel file along with load warnings."""
-
-    ensure_pandas_available()
-    filename = uploaded_file.name.lower()
-    warnings: List[str] = []
-
-    if filename.endswith(".csv"):
-        attempts = [
-            ({}, False),
-            ({"engine": "python"}, True),
-            ({"engine": "python", "on_bad_lines": "skip"}, True),
-        ]
-
-        last_exc: Optional[Exception] = None
-        for kwargs, record_warning in attempts:
-            uploaded_file.seek(0)
-            try:
-                df = pd.read_csv(uploaded_file, **kwargs)
-            except ParserError as exc:
-                last_exc = exc
-                continue
-            except Exception as exc:  # pragma: no cover - defensive
-                last_exc = exc
-                continue
-
-            if record_warning and kwargs.get("on_bad_lines") == "skip":
-                warnings.append(
-                    "一部の行で列数が一致しなかったため除外しました。データを確認してください。"
-                )
-            elif record_warning:
-                warnings.append(
-                    "標準の読み込みでエラーが発生したため、柔軟な解析モードで読み込みました。"
-                )
-
-            return df, warnings
-
-        if last_exc:
-            raise last_exc
-
-    elif filename.endswith((".xlsx", ".xls")):
-        uploaded_file.seek(0)
-        return pd.read_excel(uploaded_file), warnings
-    else:
-        raise ValueError("Unsupported file type. Please upload a CSV or Excel file.")
-
-    raise ValueError("CSVファイルの読み込みに失敗しました。ファイルの内容を確認してください。")
+    raise ValueError("CSV もしくは Excel ファイルをアップロードしてください。")
 
 
-def summarize_records(
-    df: "_pd.DataFrame",
+def prepare_map_dataframe(
+    df: pd.DataFrame,
     ward_col: str,
-    crime_col: Optional[str] = None,
-    summary_col: Optional[str] = None,
-) -> "_pd.DataFrame":
-    ensure_pandas_available()
-    columns = [ward_col]
-    rename_map = {ward_col: "区"}
+    lat_col: Optional[str],
+    lon_col: Optional[str],
+) -> pd.DataFrame:
+    """Create a dataframe compatible with st.map."""
 
-    if crime_col:
-        columns.append(crime_col)
-        rename_map[crime_col] = "犯罪種別"
+    if not lat_col or not lon_col:
+        return pd.DataFrame([TOKYO_CENTER])
 
-    if summary_col:
-        columns.append(summary_col)
-        rename_map[summary_col] = "概要"
+    map_df = df[[ward_col]].copy()
+    map_df["lat"] = pd.to_numeric(df[lat_col], errors="coerce")
+    map_df["lon"] = pd.to_numeric(df[lon_col], errors="coerce")
+    map_df = map_df.dropna(subset=["lat", "lon"])
 
-    return df[columns].rename(columns=rename_map)
+    if map_df.empty:
+        return pd.DataFrame([TOKYO_CENTER])
+
+    return map_df
 
 
-def compute_related_cases(
-    df: "_pd.DataFrame",
+def ward_summary_table(df: pd.DataFrame, ward_col: str, crime_col: Optional[str]) -> pd.DataFrame:
+    """Aggregate ward level counts for the left-bottom panel."""
+
+    counts = df.groupby(ward_col).size().reset_index(name="件数")
+
+    if crime_col and crime_col in df.columns:
+        crimes = (
+            df.groupby([ward_col, crime_col]).size().reset_index(name="件数")
+        )
+        top_crime = (
+            crimes.sort_values([ward_col, "件数"], ascending=[True, False])
+            .groupby(ward_col)
+            .head(1)
+            .rename(columns={crime_col: "最多犯罪種別", "件数": "最多件数"})
+        )
+        counts = counts.merge(top_crime, how="left", on=ward_col)
+
+    return counts.rename(columns={ward_col: "区"})
+
+
+def find_related_cases(
+    df: pd.DataFrame,
     ward_col: str,
     summary_col: Optional[str],
     selected_ward: str,
@@ -112,236 +77,156 @@ def compute_related_cases(
     crime_col: Optional[str] = None,
     selected_crime: Optional[str] = None,
     top_n: int = 5,
-) -> "_pd.DataFrame":
-    ensure_pandas_available()
+) -> pd.DataFrame:
+    """Find textually similar cases within the same ward (and crime type)."""
 
     if not summary_col or summary_col not in df.columns or not selected_summary:
         return pd.DataFrame()
 
-    candidates = df[df[ward_col] == selected_ward]
-    if crime_col and selected_crime:
-        candidates = candidates[candidates[crime_col] == selected_crime]
+    ward_rows = df[df[ward_col] == selected_ward]
 
-    candidates = candidates.dropna(subset=[summary_col])
-    if candidates.empty:
+    if crime_col and selected_crime and crime_col in df.columns:
+        ward_rows = ward_rows[ward_rows[crime_col] == selected_crime]
+
+    ward_rows = ward_rows.dropna(subset=[summary_col])
+
+    if ward_rows.empty:
         return pd.DataFrame()
 
-    def similarity(summary: str) -> float:
-        return SequenceMatcher(None, selected_summary, summary).ratio()
+    def similarity(text: str) -> float:
+        return SequenceMatcher(None, selected_summary, text).ratio()
 
-    scored = candidates.assign(_score=candidates[summary_col].apply(similarity))
-    scored = scored[scored[summary_col] != selected_summary]
-    scored = scored[scored["_score"] >= 0.3]
-    if scored.empty:
+    ranked = ward_rows.assign(_score=ward_rows[summary_col].map(similarity))
+    ranked = ranked[ranked[summary_col] != selected_summary]
+    ranked = ranked[ranked["_score"] >= 0.3]
+
+    if ranked.empty:
         return pd.DataFrame()
 
-    scored = scored.sort_values("_score", ascending=False).head(top_n)
-    return scored.drop(columns="_score")
-
-
-def display_map(
-    df: "_pd.DataFrame",
-    lat_col: Optional[str],
-    lon_col: Optional[str],
-    ward_col: str,
-    selected_ward: str,
-):
-    ensure_pandas_available()
-    st.subheader("東京都全域マップ")
-    if lat_col and lon_col and lat_col in df.columns and lon_col in df.columns:
-        map_df = df[[lat_col, lon_col, ward_col]].rename(
-            columns={lat_col: "lat", lon_col: "lon", ward_col: "区"}
-        )
-        st.map(map_df)
-    else:
-        st.info(
-            "位置情報の列が選択されていないため、東京都心部を仮表示しています。"
-        )
-        st.map(pd.DataFrame([TOKYO_CENTER]))
+    ranked = ranked.sort_values("_score", ascending=False).head(top_n)
+    return ranked.drop(columns="_score")
 
 
 def main() -> None:
-    """Render the Streamlit dashboard."""
-
-    if st is None:  # pragma: no cover - guards CLI usage without streamlit
-        raise RuntimeError(
-            "Streamlit がインストールされていません。`pip install -r requirements.txt` を実行してください。"
-        )
-
-    ensure_pandas_available()
-
-    st.set_page_config(page_title="東京都犯罪ダッシュボード", layout="wide")
+    st.set_page_config(page_title="東京都犯罪情報ダッシュボード", layout="wide")
     st.title("東京都犯罪情報ダッシュボード")
+    st.caption("CSV / Excel ファイルをアップロードして区ごとの情報を可視化します。")
 
-    st.markdown(
-        """
-        添付するCSVまたはExcelファイルをアップロードすると、区別に犯罪情報を可視化できます。
-        ファイルを変更したい場合は再度アップロードしてください。
-        """
-    )
+    uploaded = st.file_uploader("犯罪データファイルを選択", type=["csv", "xlsx", "xls"])
+    if uploaded is None:
+        st.info("まずは CSV もしくは Excel ファイルをアップロードしてください。")
+        return
 
-    uploaded = st.file_uploader(
-        "犯罪データファイル (CSV / Excel)", type=["csv", "xlsx", "xls"]
-    )
-
-    if not uploaded:
-        st.stop()
-
-    load_warnings: List[str] = []
     try:
-        data, load_warnings = load_tabular_file(uploaded)
-    except ValueError as exc:
-        st.error(str(exc))
-        st.stop()
-    except Exception as exc:  # pragma: no cover - defensive
-        st.error(f"ファイルの読み込みに失敗しました: {exc}")
-        st.stop()
+        df = read_tabular_file(uploaded)
+    except Exception as exc:  # pragma: no cover - surfaced to the UI
+        st.error(f"ファイルの読み込み中にエラーが発生しました: {exc}")
+        return
 
-    for warning in load_warnings:
-        st.warning(warning)
+    if df.empty:
+        st.warning("データが空です。別のファイルをお試しください。")
+        return
 
-    if data.empty:
-        st.warning("データが空です。内容を確認してください。")
-        st.stop()
+    columns = list(df.columns)
 
-    columns = list(data.columns)
-
-    ward_col = st.selectbox("区名の列を選択", columns)
-    crime_col = st.selectbox("犯罪種別の列を選択 (任意)", [None] + columns)
-    summary_col = st.selectbox("概要の列を選択 (任意)", [None] + columns)
-    related_col = st.selectbox("関連事例の列を選択 (任意)", [None] + columns)
-    lat_col = st.selectbox("緯度の列を選択 (任意)", [None] + columns)
-    lon_col = st.selectbox("経度の列を選択 (任意)", [None] + columns)
-
-    wards = sorted(data[ward_col].dropna().unique())
-    selected_ward = st.selectbox("表示する区を選択", wards)
-
-    crime_options = ["すべて"]
-    if crime_col:
-        crime_options += sorted(data[crime_col].dropna().unique())
-    selected_crime = st.selectbox("犯罪種別を絞り込み", crime_options)
-    selected_crime_value = (
-        selected_crime if (crime_col and selected_crime != "すべて") else None
+    st.sidebar.header("列設定")
+    ward_col = st.sidebar.selectbox("区を表す列", options=columns)
+    crime_col = st.sidebar.selectbox(
+        "犯罪種別の列", options=["(なし)"] + columns, index=0
     )
+    crime_col = None if crime_col == "(なし)" else crime_col
 
-    filtered_df = data[data[ward_col] == selected_ward]
-    if crime_col and selected_crime_value:
-        filtered_df = filtered_df[filtered_df[crime_col] == selected_crime_value]
+    summary_col = st.sidebar.selectbox(
+        "概要を表す列", options=["(なし)"] + columns, index=0
+    )
+    summary_col = None if summary_col == "(なし)" else summary_col
 
-    # Layout containers
-    upper_left, upper_right = st.columns((2, 1))
-    lower_left, lower_right = st.columns((1, 1))
+    lat_col = st.sidebar.selectbox("緯度列", options=["(なし)"] + columns, index=0)
+    lat_col = None if lat_col == "(なし)" else lat_col
 
-    selected_summary_value: Optional[str] = None
+    lon_col = st.sidebar.selectbox("経度列", options=["(なし)"] + columns, index=0)
+    lon_col = None if lon_col == "(なし)" else lon_col
 
-    with upper_left:
-        display_map(data, lat_col, lon_col, ward_col, selected_ward)
+    wards = df[ward_col].dropna().unique().tolist()
+    wards.sort()
+    selected_ward = st.sidebar.selectbox("表示する区", options=wards)
 
-    with lower_left:
-        st.subheader("区ごとの一覧")
-        ward_summary = (
-            data.groupby(ward_col)
-            .size()
-            .reset_index(name="件数")
-            .sort_values("件数", ascending=False)
+    crime_options: List[str] = []
+    selected_crime: Optional[str] = None
+    if crime_col:
+        crime_options = ["すべて"] + (
+            df[df[ward_col] == selected_ward][crime_col].dropna().unique().tolist()
         )
-        ward_summary_display = ward_summary.rename(columns={ward_col: "区"})
-        st.dataframe(ward_summary_display, use_container_width=True)
+        selected_crime = st.sidebar.selectbox("犯罪種別で絞り込み", options=crime_options)
+        if selected_crime == "すべて":
+            selected_crime = None
 
-        if not ward_summary.empty:
-            top_wards_df = ward_summary.head(3)
-            metric_cols = st.columns(len(top_wards_df))
-            for metric_col, (_, ward_row) in zip(
-                metric_cols, top_wards_df.iterrows()
-            ):
-                metric_col.metric(str(ward_row[ward_col]), f"{ward_row['件数']}件")
+    filtered = df[df[ward_col] == selected_ward]
+    if selected_crime:
+        filtered = filtered[filtered[crime_col] == selected_crime]
 
-    with upper_right:
-        st.subheader("概要")
-        if summary_col:
-            summaries = (
-                filtered_df.dropna(subset=[summary_col])
-                if not filtered_df.empty
-                else pd.DataFrame()
-            )
-            if summaries.empty:
-                st.info("該当する概要がありません。条件を変更してください。")
-                selected_summary_value = None
-            else:
-                summary_choices = (
-                    summaries[summary_col].dropna().unique().tolist()
-                )
-                selected_summary_value = st.selectbox(
-                    "表示する概要を選択",
-                    summary_choices,
-                    format_func=lambda value: str(value),
-                )
-                st.markdown(f"**選択した概要**\n\n{selected_summary_value}")
-
-                detail_columns = [ward_col]
-                if crime_col:
-                    detail_columns.append(crime_col)
-                detail_columns.append(summary_col)
-                detail_df = summarize_records(
-                    summaries[summaries[summary_col] == selected_summary_value],
-                    ward_col,
-                    crime_col,
-                    summary_col,
-                )
-                st.dataframe(detail_df, use_container_width=True)
-        else:
-            summary_df = summarize_records(filtered_df, ward_col, crime_col)
-            if summary_df.empty:
-                st.info("該当するデータがありません。条件を変更してください。")
-                selected_summary_value = None
-            else:
-                st.dataframe(summary_df, use_container_width=True)
-                selected_summary_value = None
-
-    with lower_right:
-        st.subheader("関連事例")
-        related_cases = compute_related_cases(
-            data,
-            ward_col,
-            summary_col,
-            selected_ward,
-            selected_summary_value if summary_col else None,
-            crime_col,
-            selected_crime_value,
+    summary_options: List[str] = []
+    selected_summary: Optional[str] = None
+    if summary_col:
+        summary_options = (
+            filtered[summary_col].dropna().astype(str).unique().tolist()
         )
-
-        if related_cases.empty and related_col and related_col in data.columns:
-            fallback_df = summarize_records(
-                filtered_df, ward_col, summary_col=related_col
+        summary_options.sort()
+        if summary_options:
+            selected_summary = st.sidebar.selectbox(
+                "概要を選択", options=summary_options
             )
-            fallback_df = fallback_df.rename(columns={"概要": "関連事例"})
-            if fallback_df.empty:
-                st.info("関連事例を表示できません。条件や列の選択を確認してください。")
-            else:
-                st.dataframe(fallback_df, use_container_width=True)
-        elif related_cases.empty:
-            st.info("関連事例を表示できません。条件や列の選択を確認してください。")
-        else:
-            display_columns = [ward_col]
-            rename_map = {ward_col: "区"}
 
+    top_left, top_right = st.columns((2, 1))
+
+    with top_left:
+        st.subheader("左上: 東京都全域マップ")
+        map_df = prepare_map_dataframe(df, ward_col, lat_col, lon_col)
+        st.map(map_df)
+
+    with top_right:
+        st.subheader("右上: 概要")
+        st.markdown(f"**選択中の区:** {selected_ward}")
+        if crime_col:
+            st.markdown(
+                f"**犯罪種別:** {selected_crime if selected_crime else 'すべて'}"
+            )
+        if summary_col and selected_summary:
+            st.markdown("**選択した概要:**")
+            st.info(selected_summary)
+        elif summary_col:
+            st.warning("概要を選択すると詳細が表示されます。")
+        else:
+            st.info("サイドバーで概要列を選択すると右上に詳細が表示されます。")
+
+    bottom_left, bottom_right = st.columns(2)
+
+    with bottom_left:
+        st.subheader("左下: 区一覧")
+        st.dataframe(ward_summary_table(df, ward_col, crime_col), use_container_width=True)
+
+    with bottom_right:
+        st.subheader("右下: 関連事例")
+        related = find_related_cases(
+            df=df,
+            ward_col=ward_col,
+            summary_col=summary_col,
+            selected_ward=selected_ward,
+            selected_summary=selected_summary,
+            crime_col=crime_col,
+            selected_crime=selected_crime,
+            top_n=5,
+        )
+        if related.empty:
+            st.info("関連事例を表示するには概要列からレコードを選択してください。")
+        else:
+            display_cols = [ward_col]
             if crime_col:
-                display_columns.append(crime_col)
-                rename_map[crime_col] = "犯罪種別"
-
+                display_cols.append(crime_col)
             if summary_col:
-                display_columns.append(summary_col)
-                rename_map[summary_col] = "概要"
-
-            if related_col and related_col in related_cases.columns:
-                display_columns.append(related_col)
-                rename_map[related_col] = "関連事例"
-
-            display_df = related_cases[display_columns].rename(columns=rename_map)
-            st.dataframe(display_df, use_container_width=True)
-
-    st.caption("データの列を選択して、希望のビューを作成してください。")
+                display_cols.append(summary_col)
+            st.dataframe(related[display_cols], use_container_width=True)
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry point
+if __name__ == "__main__":  # pragma: no cover - Streamlit entry point
     main()
